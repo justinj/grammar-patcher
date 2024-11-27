@@ -96,20 +96,6 @@ func tokenize(s string) []token {
 
 type Matcher func([]token) (any, []token, error)
 
-type Exactly struct {
-	token token
-}
-
-func (e *Exactly) Match(tokens []token) (any, []token, error) {
-	if len(tokens) == 0 {
-		return nil, nil, NewParseError(fmt.Sprintf("expected token %v", e.token), 0, 0)
-	}
-	if tokens[0] != e.token {
-		return nil, nil, NewParseError(fmt.Sprintf("expected token %v", e.token), tokens[0].pos, tokens[0].pos+1)
-	}
-	return nil, tokens[1:], nil
-}
-
 func Word(s string) Matcher {
 	return func(tokens []token) (any, []token, error) {
 		if len(tokens) == 0 || tokens[0].kind != word || tokens[0].val != s {
@@ -190,19 +176,6 @@ func Concat(ms ...Matcher) Matcher {
 		}
 		return matches, tokens, nil
 	}
-}
-
-type MapMatch struct {
-	matcher Matcher
-	f       func(any) any
-}
-
-func (m *MapMatch) Match(tokens []token) (any, []token, error) {
-	val, rest, err := m.matcher(tokens)
-	if err != nil {
-		return nil, nil, err
-	}
-	return m.f(val), rest, nil
 }
 
 func Map(m Matcher, f func(any) any) Matcher {
@@ -362,6 +335,7 @@ func ExprInstaller() Installer {
 					lhs = &BinOp{left: lhs, right: rhs, op: Sub}
 				}
 			}
+
 			return lhs
 		})
 
@@ -401,10 +375,37 @@ func (e Eval) Exec(sys *System) string {
 	return fmt.Sprintf("%s = %d", buf.String(), e.expr.Eval(map[string]int{"hello": 123}))
 }
 
+type WhereExpr struct {
+	input RelExpr
+	where Expression
+}
+
+func (w *WhereExpr) Format(buf *bytes.Buffer) {
+	buf.WriteString("(where ")
+	w.input.Format(buf)
+	buf.WriteString(" ")
+	w.where.Format(buf)
+	buf.WriteString(")")
+}
+
+func (w *WhereExpr) Apply(expr RelExpr) RelExpr {
+	return &WhereExpr{input: expr, where: w.where}
+}
+
 func (i Install) Exec(sys *System) string {
 	switch i.extension {
 	case "select":
 		installSelect(sys)
+		return "installed select"
+	case "where":
+		sys.Register("select/after", Map(Concat(
+			Word("where"),
+			sys.Match("expr/Expr"),
+		), func(matches any) any {
+			ms := matches.([]any)
+			return &WhereExpr{where: ms[1].(Expression)}
+		}))
+		return "installed where"
 	case "eval":
 		sys.Register("S", Map(Concat(
 			Word("eval"),
@@ -421,20 +422,42 @@ func (i Install) Exec(sys *System) string {
 
 // SELECT
 
-type Select struct {
+type RelExpr interface {
+	// Format writes the expression as an s-expression to the buffer.
+	Format(buf *bytes.Buffer)
+}
+
+type SelectExpr struct {
 	cols   []Expression
 	tables []string
 }
 
+func (s *SelectExpr) Format(buf *bytes.Buffer) {
+	buf.WriteString("(select")
+	for _, col := range s.cols {
+		buf.WriteRune(' ')
+		col.Format(buf)
+	}
+	buf.WriteString(" from")
+	for _, table := range s.tables {
+		buf.WriteRune(' ')
+		buf.WriteString(table)
+	}
+	buf.WriteString(")")
+}
+
+type Applier interface {
+	Apply(expr RelExpr) RelExpr
+}
+
+type Select struct {
+	relexpr RelExpr
+}
+
 func (s *Select) Exec(sys *System) string {
 	var buf bytes.Buffer
-	for i, col := range s.cols {
-		if i > 0 {
-			buf.WriteString(", ")
-		}
-		col.Format(&buf)
-	}
-	return fmt.Sprintf("executing SELECT %s FROM %s", buf.String(), strings.Join(s.tables, ", "))
+	s.relexpr.Format(&buf)
+	return fmt.Sprintf("executing %s", buf.String())
 }
 
 func installSelect(sys *System) {
@@ -477,7 +500,7 @@ func installSelect(sys *System) {
 		return tabs
 	}))
 
-	sys.Register("select/after", Exact())
+	sys.Denote("select/after")
 
 	sys.Register("S", Map(Concat(
 		Word("select"),
@@ -487,7 +510,11 @@ func installSelect(sys *System) {
 		sys.Match("select/after"),
 	), func(matches any) any {
 		ms := matches.([]any)
-		return &Select{cols: ms[1].([]Expression), tables: ms[3].([]string)}
+		var expr RelExpr = &SelectExpr{cols: ms[1].([]Expression), tables: ms[3].([]string)}
+		if after, ok := ms[4].(Applier); ok {
+			expr = after.Apply(expr)
+		}
+		return &Select{relexpr: expr}
 	}))
 }
 
@@ -508,11 +535,13 @@ type System struct {
 	// Each nonterminal is implicitly an Or in the order the extensions have
 	// been installed.
 	nonterminals map[string][]Matcher
+	lowpri       map[string][]Matcher
 }
 
 func NewSystem() *System {
 	return &System{
 		nonterminals: make(map[string][]Matcher),
+		lowpri:       make(map[string][]Matcher),
 	}
 }
 
@@ -523,6 +552,13 @@ func (sys *System) Install(installer Installer) {
 func (sys *System) parseNonterminal(nonterminal string, tokens []token) (any, []token, error) {
 	errs := []error{}
 	for _, matcher := range sys.nonterminals[nonterminal] {
+		result, rest, err := matcher(tokens)
+		if err == nil {
+			return result, rest, nil
+		}
+		errs = append(errs, err)
+	}
+	for _, matcher := range sys.lowpri[nonterminal] {
 		result, rest, err := matcher(tokens)
 		if err == nil {
 			return result, rest, nil
@@ -550,6 +586,12 @@ func (sys *System) parseNonterminal(nonterminal string, tokens []token) (any, []
 
 func (sys *System) Register(nonterminal string, matcher Matcher) {
 	sys.nonterminals[nonterminal] = append(sys.nonterminals[nonterminal], matcher)
+}
+
+// Denote installs a nonterminal that matches nothing, subsequent registers will have
+// precedence over the empty installation.
+func (sys *System) Denote(nonterminal string) {
+	sys.lowpri[nonterminal] = append(sys.lowpri[nonterminal], Exact())
 }
 
 func (sys *System) Match(nonterminal string) Matcher {
@@ -603,6 +645,7 @@ func (sys *System) Parse(s string) (any, error) {
 }
 
 func (sys *System) Execute(s string) string {
+	fmt.Printf("> %s\n", s)
 	val, err := sys.Parse(s)
 	if err != nil {
 		if pe, ok := err.(*ParseError); ok {
@@ -619,13 +662,16 @@ func main() {
 	sys.Install(InstallInstaller())
 	sys.Install(ExprInstaller())
 
-	sys.Execute("install select")
-	result := sys.Execute("select a, b, c from foo")
-	fmt.Println(result)
-
-	result = sys.Execute("select a as a, b, c from foo")
-	fmt.Println(result)
-
-	result = sys.Execute("select a, b, c from foo where d = 4")
-	fmt.Println(result)
+	for _, s := range []string{
+		"install select",
+		"select a, b, c from foo",
+		"select a form bar",
+		"select a, b, c from foo where d = 4",
+		"install where",
+		"select a, b, c from foo where d",
+	} {
+		result := sys.Execute(s)
+		fmt.Println(result)
+		fmt.Println()
+	}
 }
