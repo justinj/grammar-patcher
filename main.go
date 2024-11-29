@@ -2,676 +2,801 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 )
 
-// Tokenizing
+const whitespace = " \t\n\r"
 
-type tokenKind int
+type Parser func(input string) (any, string, error)
 
-const (
-	// Token types
-	eof tokenKind = iota + 128
-	word
-	ge
-	le
-	number
-)
-
-type token struct {
-	kind tokenKind
-	val  string
-	pos  int
-}
-
-func T(kind tokenKind, val string, pos int) token {
-	return token{kind: kind, val: val, pos: pos}
-}
-
-func isSpace(c rune) bool {
-	switch c {
-	case ' ', '\t', '\n', '\r':
-		return true
-	}
-	return false
-}
-
-func isWordChar(c rune) bool {
-	return 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9'
-}
-
-func tokenize(s string) []token {
-	var tokens []token
-	for i := 0; i < len(s); {
-		for i < len(s) && isSpace(rune(s[i])) {
-			i += 1
+func Word(s string) Parser {
+	return func(input string) (any, string, error) {
+		input = strings.TrimLeft(input, whitespace)
+		if strings.HasPrefix(input, s) {
+			return s, input[len(s):], nil
 		}
-		if i >= len(s) {
-			break
-		}
-		switch s[i] {
-		case '(', ')', '{', '}', '[', ']', ',', ':', ';', '.', '?', '+', '-', '*', '/', '%', '^', '&', '|', '=', '!':
-			tokens = append(tokens, T(tokenKind(s[i]), string(s[i]), i))
-			i += 1
-		case '>':
-			if i+1 < len(s) && s[i+1] == '=' {
-				tokens = append(tokens, T(ge, ">=", i))
-				i += 2
-			} else {
-				tokens = append(tokens, T(tokenKind('>'), ">", i))
-				i += 1
-			}
-		case '<':
-			if len(s) > 1 && s[1] == '=' {
-				tokens = append(tokens, T(le, "<=", i))
-				i += 2
-			} else {
-				tokens = append(tokens, T(tokenKind('<'), "<", i))
-				i += 1
-			}
-		case '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
-			// Number
-			j := i
-			for j < len(s) && '0' <= s[j] && s[j] <= '9' {
-				j += 1
-			}
-			tokens = append(tokens, T(number, s[i:j], i))
-			i = j
-		default:
-			// Word
-			j := i
-			for j < len(s) && isWordChar(rune(s[j])) {
-				j += 1
-			}
-			tokens = append(tokens, T(word, strings.ToLower(s[i:j]), i))
-			i = j
-		}
-	}
-	return tokens
-}
-
-// The good shit
-
-type Matcher func([]token) (any, []token, error)
-
-func Word(s string) Matcher {
-	return func(tokens []token) (any, []token, error) {
-		if len(tokens) == 0 || tokens[0].kind != word || tokens[0].val != s {
-			return nil, nil, NewParseError(fmt.Sprintf("expected word %q", s), tokens[0].pos, tokens[0].pos+len(s))
-		}
-		return nil, tokens[1:], nil
+		return "", "", fmt.Errorf("word %v not found", s)
 	}
 }
 
-func Exact(kinds ...tokenKind) Matcher {
-	return func(tokens []token) (any, []token, error) {
-		vals := make([]string, len(tokens))
-		for i, t := range kinds {
-			if i >= len(tokens) {
-				return nil, nil, NewParseError("unexpected EOF", 0, 0)
+func OneOf(ps ...Parser) Parser {
+	return func(input string) (any, string, error) {
+		for _, p := range ps {
+			if r, rest, err := p(input); err == nil {
+				return r, rest, nil
 			}
-			if tokens[i].kind != t {
-				return nil, nil, NewParseError(fmt.Sprintf("expected token kind %v", t), tokens[i].pos, tokens[i].pos+1)
-			}
-			vals[i] = tokens[i].val
 		}
-		return vals, tokens[len(kinds):], nil
+		return nil, "", errors.New("no parser matched")
 	}
 }
 
-func Or(ms ...Matcher) Matcher {
-	return func(tokens []token) (any, []token, error) {
-		var err error
-		for _, matcher := range ms {
-			var result any
-			result, tokens, err = matcher(tokens)
-			if err == nil {
-				return result, tokens, nil
+func Sequence(ps ...Parser) Parser {
+	return func(input string) (any, string, error) {
+		var result []any
+		for _, p := range ps {
+			r, rest, err := p(input)
+			if err != nil {
+				return nil, "", err
 			}
+			result = append(result, r)
+			input = rest
 		}
+		return result, input, nil
+	}
+}
+
+func Map(p Parser, f func(any) any) Parser {
+	return func(input string) (any, string, error) {
+		r, rest, err := p(input)
 		if err != nil {
-			return nil, nil, err
+			return nil, rest, err
 		}
-		return nil, nil, NewParseError("no matches succeeded", 0, 0)
+		return f(r), rest, nil
 	}
 }
 
-func Maybe(m Matcher) Matcher {
-	return func(tokens []token) (any, []token, error) {
-		result, rest, err := m(tokens)
-		if err != nil {
-			return nil, tokens, nil
-		}
-		return result, rest, nil
-	}
+func Optional(p Parser) Parser {
+	return OneOf(p, func(input string) (any, string, error) {
+		return nil, input, nil
+	})
 }
 
-func Repeat(m Matcher) Matcher {
-	return func(tokens []token) (any, []token, error) {
-		matches := []any{}
+func Repeat(p Parser) Parser {
+	return func(input string) (any, string, error) {
+		var result []any
 		for {
-			result, rest, err := m(tokens)
+			r, rest, err := p(input)
 			if err != nil {
 				break
 			}
-			matches = append(matches, result)
-			tokens = rest
+			result = append(result, r)
+			input = rest
 		}
-		return matches, tokens, nil
+		return result, input, nil
 	}
 }
 
-func Concat(ms ...Matcher) Matcher {
-	return func(tokens []token) (any, []token, error) {
-		var matches []any
-		for _, matcher := range ms {
-			result, rest, err := matcher(tokens)
-			if err != nil {
-				return nil, nil, err
+func Identifier(input string) (any, string, error) {
+	input = strings.TrimLeft(input, whitespace)
+	if len(input) == 0 {
+		return "", "", errors.New("unexpected eof")
+	}
+	if 'a' <= input[0] && input[0] <= 'z' || 'A' <= input[0] && input[0] <= 'Z' || input[0] == '_' {
+		i := 0
+		for i = 1; i < len(input); i++ {
+			if !('a' <= input[i] && input[i] <= 'z' || 'A' <= input[i] && input[i] <= 'Z' || '0' <= input[i] && input[i] <= '9' || input[i] == '_') {
+				break
 			}
-			matches = append(matches, result)
-			tokens = rest
 		}
-		return matches, tokens, nil
+		return input[:i], input[i:], nil
 	}
+	return "", "", errors.New("identifier not found")
 }
 
-func Map(m Matcher, f func(any) any) Matcher {
-	return func(tokens []token) (any, []token, error) {
-		val, rest, err := m(tokens)
-		if err != nil {
-			return nil, nil, err
-		}
-		return f(val), rest, nil
-	}
-}
+// %whitespace <- [ \t\n\r]*
+// List(D) <- D (',' D)*
+// Parens(D) <- '(' D ')'
 
-// Expressions
-
-type Expression interface {
-	Eval(row map[string]int) int
+type Format interface {
 	Format(buf *bytes.Buffer)
 }
 
-type Number struct {
-	val int
+type AstNode interface {
+	Format
 }
-
-func (n *Number) Eval(row map[string]int) int {
-	return n.val
-}
-
-func (n *Number) Format(buf *bytes.Buffer) {
-	buf.WriteString(strconv.Itoa(n.val))
-}
-
-type Variable struct {
-	name string
-}
-
-func (v *Variable) Eval(row map[string]int) int {
-	return row[v.name]
-}
-
-func (v *Variable) Format(buf *bytes.Buffer) {
-	buf.WriteString(v.name)
-}
-
-type Op int
-
-const (
-	Add Op = iota
-	Sub
-	Mul
-	Div
-)
 
 type BinOp struct {
-	left  Expression
-	right Expression
-	op    Op
-}
-
-func (b *BinOp) Eval(row map[string]int) int {
-	l := b.left.Eval(row)
-	r := b.right.Eval(row)
-	switch b.op {
-	case Add:
-		return l + r
-	case Sub:
-		return l - r
-	case Mul:
-		return l * r
-	case Div:
-		return l / r
-	}
-	panic("unreachable")
+	lhs Expr
+	op  string
+	rhs Expr
 }
 
 func (b *BinOp) Format(buf *bytes.Buffer) {
-	buf.WriteRune('(')
-	b.left.Format(buf)
-	switch b.op {
-	case Add:
-		buf.WriteRune('+')
-	case Sub:
-		buf.WriteRune('-')
-	case Mul:
-		buf.WriteRune('*')
-	case Div:
-		buf.WriteRune('/')
-	}
-	b.right.Format(buf)
-	buf.WriteRune(')')
+	buf.WriteByte('(')
+	b.lhs.Format(buf)
+	fmt.Fprintf(buf, " %s ", b.op)
+	b.rhs.Format(buf)
+	buf.WriteByte(')')
 }
 
-func ExprInstaller() Installer {
-	return func(sys *System) {
-		number := Map(Exact(number), func(matches any) any {
-			ms := matches.([]string)
-			val, _ := strconv.Atoi(ms[0])
-			return &Number{val: val}
-		})
-		variable := Map(Exact(word), func(matches any) any {
-			ms := matches.([]string)
-			return &Variable{name: ms[0]}
-		})
+var OperatorsByPrecedence = [][]Parser{
+	{Word("*"), Word("/")},
+	{Word("+"), Word("-")},
+	{Word("="), Word("<>"), Word("<="), Word("<"), Word(">="), Word(">")},
+}
 
-		sys.Register("expr/Factor", number)
-		sys.Register("expr/Factor", variable)
-		sys.Register("expr/Factor", Map(Concat(
-			Exact('('),
-			sys.Match("expr/Expr"),
-			Exact(')'),
-		), func(matches any) any {
-			ms := matches.([]any)
-			return ms[1]
-		}))
+var errEof = errors.New("unexpected eof")
 
-		sys.Register("expr/Term", Map(Concat(
-			sys.Match("expr/Factor"),
-			Repeat(
-				Concat(
-					Or(Exact('*'), Exact('/')),
-					sys.Match("expr/Factor"),
+func isDigit(r byte) bool {
+	return '0' <= r && r <= '9'
+}
+
+func Number(input string) (any, string, error) {
+	input = strings.TrimLeft(input, whitespace)
+	if len(input) == 0 {
+		return nil, "", errEof
+	}
+
+	i := 0
+	for i < len(input) && isDigit(input[i]) {
+		i += 1
+	}
+	if i == 0 {
+		return nil, "", errors.New("expected number")
+	}
+	num := input[:i]
+	val, _ := strconv.Atoi(num)
+
+	return DInt(val), input[i:], nil
+}
+
+type ColumnExpr struct {
+	name string
+}
+
+func (c *ColumnExpr) Format(buf *bytes.Buffer) {
+	buf.WriteString(c.name)
+}
+
+var Column = Map(Identifier, func(matches any) any {
+	return &ColumnExpr{matches.(string)}
+})
+
+func PrecExpr(sys *System, precedence int) Parser {
+	return func(input string) (any, string, error) {
+		if precedence == 0 {
+			// At this precedence, we only parse literals and open parentheses.
+			return OneOf(
+				sys.Parser("Literal"),
+				Map(
+					Sequence(
+						Word("("),
+						sys.Parser("ScalarExpr"),
+						Word(")"),
+					),
+					func(matches any) any {
+						return matches.([]any)[1]
+					},
+				),
+			)(input)
+		} else {
+			return Map(Sequence(
+				PrecExpr(sys, precedence-1),
+				Repeat(
+					Sequence(
+						OneOf(OperatorsByPrecedence[precedence-1]...),
+						PrecExpr(sys, precedence-1),
+					),
 				),
 			),
-		), func(matches any) any {
-			ms := matches.([]any)
-			lhs := ms[0].(Expression)
-			for _, m := range ms[1].([]any) {
-				ms := m.([]any)
-				op := ms[0].([]string)[0]
-				rhs := ms[1].(Expression)
-				if op == "*" {
-					lhs = &BinOp{left: lhs, right: rhs, op: Mul}
-				} else {
-					lhs = &BinOp{left: lhs, right: rhs, op: Div}
-				}
+				func(matches any) any {
+					ms := matches.([]any)
+					result := ms[0].(Expr)
+					others := ms[1].([]any)
+					for _, o := range others {
+						pair := o.([]any)
+						op := pair[0].(string)
+						expr := pair[1].(Expr)
+						result = &BinOp{
+							lhs: result,
+							op:  op,
+							rhs: expr,
+						}
+					}
+					return result
+				},
+			)(input)
+		}
+	}
+}
+
+// var ScalarExpr = PrecExpr(len(OperatorsByPrecedence))
+
+func Parens(p Parser) Parser {
+	return Map(Sequence(
+		Word("("),
+		p,
+		Word(")"),
+	), func(matches any) any {
+		return matches.([]any)[1]
+	})
+}
+
+type Expr interface {
+	Format
+}
+
+type DInt int64
+
+func (d DInt) Format(buf *bytes.Buffer) {
+	fmt.Fprintf(buf, "%d", d)
+}
+
+type DString string
+
+func (d DString) Format(buf *bytes.Buffer) {
+	fmt.Fprintf(buf, "%s", d)
+}
+
+func CommaSeparated(parser Parser) Parser {
+	return func(input string) (any, string, error) {
+		result := []any{}
+		r, input, err := parser(input)
+		if err != nil {
+			return nil, input, err
+		}
+		result = append(result, r)
+		for {
+			_, rest, err := Word(",")(input)
+			if err != nil {
+				break
 			}
-			return lhs
-		}))
-
-		expr := Map(Concat(
-			sys.Match("expr/Term"),
-			Repeat(
-				Concat(
-					Or(Exact('+'), Exact('-')),
-					sys.Match("expr/Term"),
-				),
-			),
-		), func(matches any) any {
-			ms := matches.([]any)
-			lhs := ms[0].(Expression)
-			for _, m := range ms[1].([]any) {
-				ms := m.([]any)
-				op := ms[0].([]string)[0]
-				rhs := ms[1].(Expression)
-				if op == "+" {
-					lhs = &BinOp{left: lhs, right: rhs, op: Add}
-				} else {
-					lhs = &BinOp{left: lhs, right: rhs, op: Sub}
-				}
+			r, rest, err = parser(rest)
+			if err != nil {
+				return nil, input, err
 			}
-
-			return lhs
-		})
-
-		sys.Register("expr/Expr", expr)
+			result = append(result, r)
+			input = rest
+		}
+		return result, input, nil
 	}
 }
 
-// Top-Level Commands
+// SelectStmt <- SimpleSelect (SetopClause SimpleSelect)*
 
-type Exec interface {
-	Exec(*System) string
+type SelectStmt struct {
+	lhs AstNode
+	op  SetopClause
+	rhs AstNode
 }
 
-type Install struct {
-	extension string
+func (s *SelectStmt) Format(buf *bytes.Buffer) {
+	s.lhs.Format(buf)
+	s.op.Format(buf)
+	s.rhs.Format(buf)
 }
 
-func InstallInstaller() Installer {
-	return func(sys *System) {
-		sys.Register("S", Map(Concat(
-			Word("install"),
-			Exact(word),
-		), func(matches any) any {
-			ms := matches.([]any)
-			return Install{extension: ms[1].([]string)[0]}
-		}))
+// SetopClause <-
+//     ('UNION' / 'EXCEPT' / 'INTERSECT') 'ALL'?
+
+type SetopClause struct {
+	op  string
+	all bool
+}
+
+func (s *SetopClause) Format(buf *bytes.Buffer) {
+	fmt.Fprintf(buf, " %s ", s.op)
+	if s.all {
+		buf.WriteString("ALL ")
 	}
 }
 
-type Eval struct {
-	expr Expression
-}
+var SetopClauseParser = Map(
+	Sequence(OneOf(Word("UNION"), Word("EXCEPT"), Word("INTERSECT")), Optional(Word("ALL"))),
+	func(matches any) any {
+		ms := matches.([]any)
+		return &SetopClause{ms[0].(string), ms[1] != nil}
+	},
+)
 
-func (e Eval) Exec(sys *System) string {
-	var buf bytes.Buffer
-	e.expr.Format(&buf)
-	return fmt.Sprintf("%s = %d", buf.String(), e.expr.Eval(map[string]int{"hello": 123}))
-}
-
-type WhereExpr struct {
-	input RelExpr
-	where Expression
-}
-
-func (w *WhereExpr) Format(buf *bytes.Buffer) {
-	buf.WriteString("(where ")
-	w.input.Format(buf)
-	buf.WriteString(" ")
-	w.where.Format(buf)
-	buf.WriteString(")")
-}
-
-func (w *WhereExpr) Apply(expr RelExpr) RelExpr {
-	return &WhereExpr{input: expr, where: w.where}
-}
-
-func (i Install) Exec(sys *System) string {
-	switch i.extension {
-	case "select":
-		installSelect(sys)
-		return "installed select"
-	case "where":
-		sys.Register("select/after", Map(Concat(
-			Word("where"),
-			sys.Match("expr/Expr"),
-		), func(matches any) any {
-			ms := matches.([]any)
-			return &WhereExpr{where: ms[1].(Expression)}
-		}))
-		return "installed where"
-	case "eval":
-		sys.Register("S", Map(Concat(
-			Word("eval"),
-			sys.Match("expr/Expr"),
-		), func(matches any) any {
-			ms := matches.([]any)
-			expr := ms[1].(Expression)
-			return Eval{expr: expr}
-		}))
-		return "installed eval"
-	}
-	return fmt.Sprintf("Unknown extension: %s", i.extension)
-}
-
-// SELECT
-
-type RelExpr interface {
-	// Format writes the expression as an s-expression to the buffer.
-	Format(buf *bytes.Buffer)
-}
-
-type SelectExpr struct {
-	cols   []Expression
-	tables []string
-}
-
-func (s *SelectExpr) Format(buf *bytes.Buffer) {
-	buf.WriteString("(select")
-	for _, col := range s.cols {
-		buf.WriteRune(' ')
-		col.Format(buf)
-	}
-	buf.WriteString(" from")
-	for _, table := range s.tables {
-		buf.WriteRune(' ')
-		buf.WriteString(table)
-	}
-	buf.WriteString(")")
-}
-
-type Applier interface {
-	Apply(expr RelExpr) RelExpr
-}
+// SimpleSelect <- WithClause? SelectClause FromClause?
+//     WhereClause? GroupByClause? HavingClause?
+//     OrderByClause? LimitClause?
 
 type Select struct {
-	relexpr RelExpr
+	exprs   []AliasExpression
+	tables  []string
+	with    *WithClause
+	where   *WhereClause
+	groupBy *GroupByClause
+	having  *HavingClause
+	orderBy *OrderByClause
+	limit   *LimitClause
 }
 
-func (s *Select) Exec(sys *System) string {
-	var buf bytes.Buffer
-	s.relexpr.Format(&buf)
-	return fmt.Sprintf("executing %s", buf.String())
-}
-
-func installSelect(sys *System) {
-	sys.Register("select/col-list", Map(Concat(
-		sys.Match("expr/Expr"),
-		Repeat(
-			Concat(
-				Exact(','),
-				sys.Match("expr/Expr"),
-			),
-		),
-	), func(matches any) any {
-		ms := matches.([]any)
-		cols := []Expression{ms[0].(Expression)}
-		rest := ms[1].([]any)
-		for _, m := range rest {
-			ms := m.([]any)
-			cols = append(cols, ms[1].(Expression))
+func (s *Select) Format(buf *bytes.Buffer) {
+	if s.with != nil {
+		s.with.Format(buf)
+	}
+	buf.WriteString("SELECT ")
+	for i, e := range s.exprs {
+		if i > 0 {
+			buf.WriteString(", ")
 		}
-		return cols
+		e.Format(buf)
+	}
+	buf.WriteString(" FROM ")
+	for i, e := range s.tables {
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		buf.WriteString(e)
+	}
+	if s.where != nil {
+		s.where.Format(buf)
+	}
+	if s.groupBy != nil {
+		s.groupBy.Format(buf)
+	}
+	if s.having != nil {
+		s.having.Format(buf)
+	}
+	if s.orderBy != nil {
+		s.orderBy.Format(buf)
+	}
+	if s.limit != nil {
+		s.limit.Format(buf)
+	}
+}
+
+// WithStatement <- Identifier 'AS' SubqueryReference
+
+type WithStatement struct {
+	name     string
+	subquery *Select
+}
+
+func (w *WithStatement) Format(buf *bytes.Buffer) {
+	buf.WriteString(w.name)
+	buf.WriteString(" AS (")
+	w.subquery.Format(buf)
+	buf.WriteString(") ")
+}
+
+// WithClause <- 'WITH' List(WithStatement)
+
+type WithClause struct {
+	statements []*WithStatement
+}
+
+func (w *WithClause) Format(buf *bytes.Buffer) {
+	buf.WriteString("WITH ")
+	for i, stmt := range w.statements {
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		stmt.Format(buf)
+	}
+}
+
+// SelectClause <- 'SELECT' ('*' / List(AliasExpression))
+// ColumnsAlias <- Parens(List(Identifier))
+// TableReference <-
+//     (SubqueryReference 'AS'? Identifier ColumnsAlias?) /
+//     (Identifier ('AS'? Identifier)?)
+// ExplicitJoin <- ('LEFT' / 'FULL')? 'OUTER'?
+//     'JOIN' TableReference 'ON' Expression
+// FromClause <- 'FROM' TableReference
+//     ((',' TableReference) / ExplicitJoin)*
+// WhereClause <- 'WHERE' Expression
+
+type WhereClause struct {
+	expr Expr
+}
+
+func (w *WhereClause) Format(buf *bytes.Buffer) {
+	buf.WriteString(" WHERE ")
+	w.expr.Format(buf)
+}
+
+// GroupByClause <- 'GROUP' 'BY' List(Expression)
+
+type GroupByClause struct {
+	exprs []Expr
+}
+
+func (g *GroupByClause) Format(buf *bytes.Buffer) {
+	buf.WriteString(" GROUP BY ")
+	for i, expr := range g.exprs {
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		expr.Format(buf)
+	}
+}
+
+// HavingClause <- 'HAVING' Expression
+
+type HavingClause struct {
+	expr Expr
+}
+
+func (h *HavingClause) Format(buf *bytes.Buffer) {
+	buf.WriteString(" HAVING ")
+	h.expr.Format(buf)
+}
+
+// OrderByExpression <- Expression ('DESC' / 'ASC')?
+//     ('NULLS' 'FIRST' / 'LAST')?
+
+type OrderByExpression struct {
+	expr  Expr
+	desc  bool
+	nulls string // "first", "last" or ""
+}
+
+func (o *OrderByExpression) Format(buf *bytes.Buffer) {
+	o.expr.Format(buf)
+	if o.desc {
+		buf.WriteString(" DESC")
+	} else {
+		buf.WriteString(" ASC")
+	}
+	if o.nulls != "" {
+		fmt.Fprintf(buf, " NULLS %s", strings.ToUpper(o.nulls))
+	}
+}
+
+// OrderByClause <- 'ORDER' 'BY' List(OrderByExpression)
+
+type OrderByClause struct {
+	exprs []*OrderByExpression
+}
+
+func (o *OrderByClause) Format(buf *bytes.Buffer) {
+	buf.WriteString(" ORDER BY ")
+	for i, expr := range o.exprs {
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		expr.Format(buf)
+	}
+}
+
+// LimitClause <- 'LIMIT' NumberLiteral
+
+type LimitClause struct {
+	limit DInt
+}
+
+func (l *LimitClause) Format(buf *bytes.Buffer) {
+	fmt.Fprintf(buf, " LIMIT %d", l.limit)
+}
+
+var LimitClauseParser = Map(
+	Sequence(Word("LIMIT"), Number),
+	func(matches any) any {
+		ms := matches.([]any)
+		limit := ms[1].(DInt)
+		return &LimitClause{limit: limit}
 	},
-	))
+)
 
-	sys.Register("select/table-list", Map(Concat(
-		Exact(word),
-		Repeat(
-			Concat(
-				Exact(','),
-				Exact(word),
-			),
-		),
-	), func(matches any) any {
-		ms := matches.([]any)
-		tabs := []string{ms[0].([]string)[0]}
-		rest := ms[1].([]any)
-		for _, m := range rest {
-			ms := m.([]any)
-			tabs = append(tabs, ms[1].([]string)[0])
-		}
-		return tabs
-	}))
+// AliasExpression <- Expression ('AS'? Identifier)?
 
-	sys.Denote("select/after")
-
-	sys.Register("S", Map(Concat(
-		Word("select"),
-		sys.Match("select/col-list"),
-		Word("from"),
-		sys.Match("select/table-list"),
-		sys.Match("select/after"),
-	), func(matches any) any {
-		ms := matches.([]any)
-		var expr RelExpr = &SelectExpr{cols: ms[1].([]Expression), tables: ms[3].([]string)}
-		if after, ok := ms[4].(Applier); ok {
-			expr = after.Apply(expr)
-		}
-		return &Select{relexpr: expr}
-	}))
+type AliasExpression struct {
+	expr Expr
+	as   string
 }
 
-// Framework
-
-type NonterminalMatch struct {
-	nonterminal string
-	system      *System
+func (a *AliasExpression) Format(buf *bytes.Buffer) {
+	a.expr.Format(buf)
+	if a.as != "" {
+		fmt.Fprintf(buf, " AS %s", a.as)
+	}
 }
-
-func (n *NonterminalMatch) Match(tokens []token) (any, []token, error) {
-	return n.system.parseNonterminal(n.nonterminal, tokens)
-}
-
-type Installer func(sys *System)
 
 type System struct {
-	// Each nonterminal is implicitly an Or in the order the extensions have
-	// been installed.
-	nonterminals map[string][]Matcher
-	lowpri       map[string][]Matcher
+	nonterminals map[string][]Parser
 }
 
 func NewSystem() *System {
-	return &System{
-		nonterminals: make(map[string][]Matcher),
-		lowpri:       make(map[string][]Matcher),
-	}
+	return &System{nonterminals: map[string][]Parser{}}
 }
 
-func (sys *System) Install(installer Installer) {
-	installer(sys)
+func (s *System) Install(nonterminal string, parser Parser) {
+	s.nonterminals[nonterminal] = append(s.nonterminals[nonterminal], parser)
 }
 
-func (sys *System) parseNonterminal(nonterminal string, tokens []token) (any, []token, error) {
-	errs := []error{}
-	for _, matcher := range sys.nonterminals[nonterminal] {
-		result, rest, err := matcher(tokens)
-		if err == nil {
-			return result, rest, nil
-		}
-		errs = append(errs, err)
-	}
-	for _, matcher := range sys.lowpri[nonterminal] {
-		result, rest, err := matcher(tokens)
-		if err == nil {
-			return result, rest, nil
-		}
-		errs = append(errs, err)
-	}
-	if len(errs) > 0 {
-		var bestErr *ParseError
-		// return the parse error that got the furthest
-		for _, err := range errs {
-			if pe, ok := err.(*ParseError); ok {
-				if bestErr == nil {
-					bestErr = pe
-				} else {
-					if pe.start > bestErr.start {
-						bestErr = pe
-					}
-				}
+func (s *System) InstallFront(nonterminal string, parser Parser) {
+	s.nonterminals[nonterminal] = append([]Parser{parser}, s.nonterminals[nonterminal]...)
+}
+
+func (s *System) Parser(nonterminal string) Parser {
+	return func(input string) (any, string, error) {
+		for _, parser := range s.nonterminals[nonterminal] {
+			if r, rest, err := parser(input); err == nil {
+				return r, rest, nil
 			}
 		}
-		return nil, nil, bestErr
-	}
-	return nil, nil, fmt.Errorf("no match for nonterminal %q", nonterminal)
-}
-
-func (sys *System) Register(nonterminal string, matcher Matcher) {
-	sys.nonterminals[nonterminal] = append(sys.nonterminals[nonterminal], matcher)
-}
-
-// Denote installs a nonterminal that matches nothing, subsequent registers will have
-// precedence over the empty installation.
-func (sys *System) Denote(nonterminal string) {
-	sys.lowpri[nonterminal] = append(sys.lowpri[nonterminal], Exact())
-}
-
-func (sys *System) Match(nonterminal string) Matcher {
-	return func(tokens []token) (any, []token, error) {
-		return sys.parseNonterminal(nonterminal, tokens)
+		return nil, input, fmt.Errorf("no parser matched")
 	}
 }
 
-type ParseError struct {
-	msg   string
-	start int
-	end   int
-}
+func InstallSelect(sys *System) {
+	// Some of these things need to be installed like this to avoid
+	// Golang initialization order issues.
+	sys.Install("WithClause", Map(
+		Sequence(
+			Word("WITH"),
+			CommaSeparated(sys.Parser("WithStatement")),
+		),
+		func(matches any) any {
+			ms := matches.([]any)
+			stmts := ms[1].([]any)
+			result := make([]*WithStatement, len(stmts))
+			for i, stmt := range stmts {
+				result[i] = stmt.(*WithStatement)
+			}
+			return &WithClause{statements: result}
+		},
+	))
 
-func NewParseError(msg string, start int, end int) *ParseError {
-	return &ParseError{msg: msg, start: start, end: end}
-}
+	sys.Install("WithStatement", Map(
+		Sequence(
+			Identifier,
+			Word("AS"),
+			sys.Parser("SubqueryReference"),
+		),
+		func(matches any) any {
+			ms := matches.([]any)
+			return &WithStatement{
+				name:     ms[0].(string),
+				subquery: ms[2].(*Select),
+			}
+		},
+	))
 
-func (e *ParseError) Error() string {
-	return e.ErrMsg("")
-}
+	// SubqueryReference <- Parens(SelectStmt)
+	sys.Install("SubqueryReference", Parens(sys.Parser("SelectStmt")))
 
-func (e *ParseError) ErrMsg(input string) string {
-	var buf bytes.Buffer
-	buf.WriteString("parse error:\n")
-	buf.WriteString(input)
-	buf.WriteByte('\n')
-	for i := 0; i < e.start; i++ {
-		buf.WriteRune(' ')
-	}
-	buf.WriteByte('^')
-	for i := e.start; i < e.end-2; i++ {
-		buf.WriteByte('~')
-	}
-	buf.WriteByte('^')
-	buf.WriteByte('\n')
-	buf.WriteString(e.msg)
-	return buf.String()
-}
+	sys.Install("SelectStmt", Map(
+		Sequence(sys.Parser("Select"), Repeat(Sequence(SetopClauseParser, sys.Parser("Select")))),
+		func(matches any) any {
+			ms := matches.([]any)
+			lhs := ms[0].(AstNode)
+			others := ms[1].([]any)
+			for _, o := range others {
+				pair := o.([]any)
+				op := pair[0].(*SetopClause)
+				expr := pair[1].(AstNode)
+				lhs = &SelectStmt{lhs: lhs, op: *op, rhs: expr}
+			}
+			return lhs
+		},
+	))
 
-func (sys *System) Parse(s string) (any, error) {
-	tokens := tokenize(s)
-	val, tokens, err := sys.parseNonterminal("S", tokens)
-	if err != nil {
-		return nil, err
-	}
-	if len(tokens) > 0 {
-		return nil, NewParseError("unconsumed tokens", tokens[0].pos, len(s))
-	}
-	return val, nil
-}
-
-func (sys *System) Execute(s string) string {
-	fmt.Printf("> %s\n", s)
-	val, err := sys.Parse(s)
-	if err != nil {
-		if pe, ok := err.(*ParseError); ok {
-			return pe.ErrMsg(s)
+	sys.Install("Select", Map(Sequence(
+		Optional(sys.Parser("WithClause")),
+		Word("SELECT"),
+		CommaSeparated(sys.Parser("AliasExpression")),
+		Word("FROM"),
+		Identifier,
+		Optional(sys.Parser("WhereClause")),
+		Optional(sys.Parser("GroupByClause")),
+		Optional(sys.Parser("HavingClause")),
+		Optional(sys.Parser("OrderByClause")),
+		Optional(LimitClauseParser),
+	), func(matches any) any {
+		ms := matches.([]any)
+		var with *WithClause
+		if ms[0] != nil {
+			with = ms[0].(*WithClause)
 		}
-		return err.Error()
+		exprsA := ms[2].([]any)
+		exprs := make([]AliasExpression, len(exprsA))
+		for i := range exprs {
+			exprs[i] = exprsA[i].(AliasExpression)
+		}
+		tables := []string{ms[4].(string)}
+		var where *WhereClause
+		if ms[5] != nil {
+			where = ms[5].(*WhereClause)
+		}
+		var groupBy *GroupByClause
+		if ms[6] != nil {
+			groupBy = ms[6].(*GroupByClause)
+		}
+		var having *HavingClause
+		if ms[7] != nil {
+			having = ms[7].(*HavingClause)
+		}
+		var orderBy *OrderByClause
+		if ms[8] != nil {
+			orderBy = ms[8].(*OrderByClause)
+		}
+		var limit *LimitClause
+		if ms[9] != nil {
+			limit = ms[9].(*LimitClause)
+		}
+		return &Select{
+			with:    with,
+			exprs:   exprs,
+			tables:  tables,
+			where:   where,
+			groupBy: groupBy,
+			having:  having,
+			orderBy: orderBy,
+			limit:   limit,
+		}
+	}))
+
+	sys.Install("AliasExpression", Map(
+		Sequence(sys.Parser("ScalarExpr"), Optional(Sequence(Word("AS"), Identifier))),
+		func(matches any) any {
+			ms := matches.([]any)
+			expr := ms[0].(Expr)
+			as := ""
+			if ms[1] != nil {
+				as = ms[1].([]any)[1].(string)
+			}
+			return AliasExpression{expr, as}
+		},
+	))
+
+	sys.Install("WhereClause", Map(
+		Sequence(
+			Word("WHERE"),
+			sys.Parser("ScalarExpr"),
+		),
+		func(matches any) any {
+			ms := matches.([]any)
+			expr := ms[1].(Expr)
+			return &WhereClause{expr: expr}
+		},
+	))
+
+	sys.Install("GroupByClause", Map(
+		Sequence(Word("GROUP"), Word("BY"), CommaSeparated(sys.Parser("ScalarExpr"))),
+		func(matches any) any {
+			ms := matches.([]any)
+			exprs := ms[2].([]any)
+			result := make([]Expr, len(exprs))
+			for i, expr := range exprs {
+				result[i] = expr.(Expr)
+			}
+			return &GroupByClause{exprs: result}
+		},
+	))
+
+	sys.Install("HavingClause", Map(
+		Sequence(
+			Word("HAVING"),
+			sys.Parser("ScalarExpr"),
+		),
+		func(matches any) any {
+			ms := matches.([]any)
+			expr := ms[1].(Expr)
+			return &HavingClause{expr: expr}
+		},
+	))
+
+	sys.Install("OrderByExpression", Map(
+		Sequence(
+			sys.Parser("ScalarExpr"),
+			Optional(OneOf(Word("DESC"), Word("ASC"))),
+			Optional(
+				Sequence(
+					Word("NULLS"),
+					OneOf(Word("FIRST"), Word("LAST")),
+				),
+			),
+		),
+		func(matches any) any {
+			ms := matches.([]any)
+			expr := ms[0].(Expr)
+			desc := false
+			if ms[1] != nil {
+				desc = ms[1].(string) == "DESC"
+			}
+			nulls := ""
+			if ms[2] != nil {
+				nulls = strings.ToLower(ms[2].([]any)[1].(string))
+			}
+			return &OrderByExpression{
+				expr:  expr,
+				desc:  desc,
+				nulls: nulls,
+			}
+		},
+	))
+
+	sys.Install("OrderByClause", Map(
+		Sequence(
+			Word("ORDER"),
+			Word("BY"),
+			CommaSeparated(sys.Parser("OrderByExpression")),
+		),
+		func(matches any) any {
+			ms := matches.([]any)
+			exprs := ms[2].([]any)
+			result := make([]*OrderByExpression, len(exprs))
+			for i, expr := range exprs {
+				result[i] = expr.(*OrderByExpression)
+			}
+			return &OrderByClause{exprs: result}
+		},
+	))
+
+	sys.Install("ScalarExpr", PrecExpr(sys, len(OperatorsByPrecedence)))
+
+	sys.Install("Literal", OneOf(Number, Column))
+}
+
+type ArrayExpr []Expr
+
+func (a *ArrayExpr) Format(buf *bytes.Buffer) {
+	buf.WriteString("ARRAY[")
+	for i, expr := range *a {
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		expr.Format(buf)
 	}
-	return val.(Exec).Exec(sys)
+	buf.WriteString("]")
+}
+
+func InstallArrayLiteral(sys *System) {
+	sys.Install("ArrayLiteral", func(input string) (any, string, error) {
+		return Map(
+			Sequence(Word("ARRAY["), CommaSeparated(sys.Parser("ScalarExpr")), Word("]")),
+			func(matches any) any {
+				ms := matches.([]any)
+				exprs := ms[1].([]any)
+				result := make(ArrayExpr, len(exprs))
+				for i, expr := range exprs {
+					result[i] = expr.(Expr)
+				}
+				return &result
+			},
+		)(input)
+	})
+
+	sys.InstallFront("Literal", sys.Parser("ArrayLiteral"))
+}
+
+func (sys *System) RunCommand(command string) {
+	fmt.Printf("> %s\n", command)
+	result, rest, err := sys.Parser("SelectStmt")(command)
+	if err != nil || len(rest) > 0 {
+		fmt.Printf("error: %v\n\n", err)
+		return
+	}
+	var out bytes.Buffer
+	out.WriteString("result: ")
+	result.(AstNode).Format(&out)
+	fmt.Println(out.String())
+	fmt.Println()
 }
 
 func main() {
 	sys := NewSystem()
 
-	sys.Install(InstallInstaller())
-	sys.Install(ExprInstaller())
+	sys.RunCommand("SELECT 1 FROM b")
 
-	for _, s := range []string{
-		"install select",
-		"select a, b, c from foo",
-		"select a form bar",
-		"select a, b, c from foo where d = 4",
-		"install where",
-		"select a, b, c from foo where d",
-	} {
-		result := sys.Execute(s)
-		fmt.Println(result)
-		fmt.Println()
-	}
+	InstallSelect(sys)
+	fmt.Println("installed select extension")
+	fmt.Println()
+
+	sys.RunCommand("SELECT 1 FROM b")
+	sys.RunCommand("SELECT ARRAY[1, 2, 3] FROM b")
+
+	InstallArrayLiteral(sys)
+	fmt.Println("installed array literal extension")
+	fmt.Println()
+
+	sys.RunCommand("SELECT ARRAY[1, 2, 3] FROM b")
 }
