@@ -750,20 +750,18 @@ func (a *ArrayExpr) Format(buf *bytes.Buffer) {
 }
 
 func InstallArrayLiteral(sys *System) {
-	sys.Install("ArrayLiteral", func(input string) (any, string, error) {
-		return Map(
-			Sequence(Word("ARRAY["), CommaSeparated(sys.Parser("ScalarExpr")), Word("]")),
-			func(matches any) any {
-				ms := matches.([]any)
-				exprs := ms[1].([]any)
-				result := make(ArrayExpr, len(exprs))
-				for i, expr := range exprs {
-					result[i] = expr.(Expr)
-				}
-				return &result
-			},
-		)(input)
-	})
+	sys.Install("ArrayLiteral", Map(
+		Sequence(Word("ARRAY["), CommaSeparated(sys.Parser("ScalarExpr")), Word("]")),
+		func(matches any) any {
+			ms := matches.([]any)
+			exprs := ms[1].([]any)
+			result := make(ArrayExpr, len(exprs))
+			for i, expr := range exprs {
+				result[i] = expr.(Expr)
+			}
+			return &result
+		},
+	))
 
 	sys.InstallFront("Literal", sys.Parser("ArrayLiteral"))
 }
