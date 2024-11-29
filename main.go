@@ -750,7 +750,7 @@ func (a *ArrayExpr) Format(buf *bytes.Buffer) {
 }
 
 func InstallArrayLiteral(sys *System) {
-	sys.Install("ArrayLiteral", Map(
+	sys.InstallFront("Literal", Map(
 		Sequence(Word("ARRAY["), CommaSeparated(sys.Parser("ScalarExpr")), Word("]")),
 		func(matches any) any {
 			ms := matches.([]any)
@@ -762,8 +762,6 @@ func InstallArrayLiteral(sys *System) {
 			return &result
 		},
 	))
-
-	sys.InstallFront("Literal", sys.Parser("ArrayLiteral"))
 }
 
 func (sys *System) RunCommand(command string) {
